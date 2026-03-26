@@ -134,6 +134,35 @@ CHINA_TZ = ZoneInfo("Asia/Shanghai")       # 中国时区
 # 合约数据全局缓存字典
 symbol_contract_map: dict[str, ContractData] = {}
 
+def parse_reject_from_status_msg(status_msg: str) -> tuple[int | None, str]:
+    status_msg = status_msg.strip()
+    if not status_msg:
+        return None, ""
+
+    k = 0
+    while k < len(status_msg):
+        while k < len(status_msg) and not status_msg[k].isdigit():
+            k += 1
+        if k >= len(status_msg):
+            break
+
+        i = k
+        while i < len(status_msg) and status_msg[i].isdigit():
+            i += 1
+
+        j = i
+        while j < len(status_msg) and status_msg[j].isspace():
+            j += 1
+
+        if j < len(status_msg) and status_msg[j] == ":":
+            code = int(status_msg[k:i])
+            reason = status_msg[j + 1 :].lstrip()
+            return code, reason
+
+        k = i
+
+    return None, ""
+
 
 class CtptestGateway(BaseGateway):
     """
@@ -277,7 +306,15 @@ class CtptestMdApi(MdApi):
     def onFrontDisconnected(self, reason: int) -> None:
         """服务器连接断开回报"""
         self.login_status = False
-        self.gateway.write_log(f"行情服务器连接断开，原因{reason}")
+        reason_map = {
+            0x1001: "网络读失败",
+            0x1002: "网络写失败",
+            0x2001: "接收心跳超时",
+            0x2002: "发送心跳失败",
+            0x2003: "收到错误报文",
+        }
+        reason_text = reason_map.get(reason, "未知原因")
+        self.gateway.write_log(f"行情服务器连接断开，原因码: {reason} ({reason_text})")
 
     def onRspUserLogin(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """用户登录请求回报"""
@@ -455,7 +492,15 @@ class CtptestTdApi(TdApi):
     def onFrontDisconnected(self, reason: int) -> None:
         """服务器连接断开回报"""
         self.login_status = False
-        self.gateway.write_log(f"交易服务器连接断开，原因{reason}")
+        reason_map = {
+            0x1001: "网络读失败",
+            0x1002: "网络写失败",
+            0x2001: "接收心跳超时",
+            0x2002: "发送心跳失败",
+            0x2003: "收到错误报文",
+        }
+        reason_text = reason_map.get(reason, "未知原因")
+        self.gateway.write_log(f"交易服务器连接断开，原因码: {reason} ({reason_text})")
 
     def onRspAuthenticate(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """用户授权验证回报"""
@@ -492,17 +537,36 @@ class CtptestTdApi(TdApi):
         orderid: str = f"{self.frontid}_{self.sessionid}_{order_ref}"
 
         symbol: str = data["InstrumentID"]
-        contract: ContractData = symbol_contract_map[symbol]
+        contract: ContractData | None = symbol_contract_map.get(symbol, None)
+        exchange: Exchange = (
+            contract.exchange
+            if contract
+            else EXCHANGE_CTP2VT.get(data.get("ExchangeID", ""), Exchange.LOCAL)
+        )
+
+        error_id: int = error.get("ErrorID", 0) if error else 0
+        error_msg: str = error.get("ErrorMsg", "") if error else ""
+        status_msg: str = error_msg
+        parsed_code, parsed_reason = parse_reject_from_status_msg(error_msg)
+        reject_code: int | None = (
+            parsed_code
+            if parsed_code is not None
+            else (error_id if error_id else None)
+        )
+        reject_reason: str = parsed_reason if parsed_code is not None else error_msg
 
         order: OrderData = OrderData(
             symbol=symbol,
-            exchange=contract.exchange,
+            exchange=exchange,
             orderid=orderid,
             direction=DIRECTION_CTP2VT[data["Direction"]],
             offset=OFFSET_CTP2VT.get(data["CombOffsetFlag"], Offset.NONE),
             price=data["LimitPrice"],
             volume=data["VolumeTotalOriginal"],
             status=Status.REJECTED,
+            status_msg=status_msg,
+            reject_code=reject_code,
+            reject_reason=reject_reason,
             gateway_name=self.gateway_name
         )
         self.gateway.on_order(order)
@@ -657,24 +721,39 @@ class CtptestTdApi(TdApi):
         order_ref: str = data["OrderRef"]
         orderid: str = f"{frontid}_{sessionid}_{order_ref}"
 
+        status: Status | None = STATUS_CTP2VT.get(data["OrderStatus"], None)
+        if not status:
+            self.gateway.write_log(f"收到不支持的委托状态，委托号：{orderid}")
+            return
+
         timestamp: str = f"{data['InsertDate']} {data['InsertTime']}"
         dt: datetime = datetime.strptime(timestamp, "%Y%m%d %H:%M:%S")
         dt = dt.replace(tzinfo=CHINA_TZ)
 
         tp: tuple = (data["OrderPriceType"], data["TimeCondition"], data["VolumeCondition"])
+        order_type: OrderType | None = ORDERTYPE_CTP2VT.get(tp, None)
+        if not order_type:
+            self.gateway.write_log(f"收到不支持的委托类型，委托号：{orderid}")
+            return
+
+        status_msg: str = data.get("StatusMsg", "")
+        reject_code, reject_reason = parse_reject_from_status_msg(status_msg)
 
         order: OrderData = OrderData(
             symbol=symbol,
             exchange=contract.exchange,
             orderid=orderid,
-            type=ORDERTYPE_CTP2VT[tp],
+            type=order_type,
             direction=DIRECTION_CTP2VT[data["Direction"]],
             offset=OFFSET_CTP2VT[data["CombOffsetFlag"]],
             price=data["LimitPrice"],
             volume=data["VolumeTotalOriginal"],
             traded=data["VolumeTraded"],
-            status=STATUS_CTP2VT[data["OrderStatus"]],
+            status=status,
             datetime=dt,
+            status_msg=status_msg,
+            reject_code=reject_code,
+            reject_reason=reject_reason,
             gateway_name=self.gateway_name
         )
         self.gateway.on_order(order)
